@@ -344,6 +344,41 @@ async function chooseWslStartupRecovery(
   return result.response === 0 ? 'local' : 'quit'
 }
 
+/** Keep post-health WSL recovery failures on the native trusted surface. */
+async function chooseWslProfileRecoveryFailure(
+  distribution: string,
+  message: string,
+): Promise<'local' | 'quit'> {
+  const locale = desktopLocaleFromLanguageTag(app.getLocale())
+  const detail = maskSecrets(message)
+  const copy = locale === 'zh'
+    ? {
+        title: 'WSL 配置恢复失败',
+        message: `DSH Desktop 无法在「${distribution}」中完成配置恢复。`,
+        detail: `${detail}\n\n你可以切回本机 Host。WSL 中的 Profile、诊断和数据会保留，便于之后在 WSL 终端中修复。`,
+        local: '切回本机 Host',
+        quit: '退出',
+      }
+    : {
+        title: 'WSL Profile recovery failed',
+        message: `DSH Desktop could not complete Profile recovery in “${distribution}”.`,
+        detail: `${detail}\n\nYou can switch to the Local Host. The WSL Profile, diagnostics, and data are preserved for repair from a WSL terminal.`,
+        local: 'Use Local Host',
+        quit: 'Quit',
+      }
+  const result = await dialog.showMessageBox({
+    type: 'error',
+    title: copy.title,
+    message: copy.message,
+    detail: copy.detail,
+    buttons: [copy.local, copy.quit],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  })
+  return result.response === 0 ? 'local' : 'quit'
+}
+
 /** Start one Electron process and leave lifetime to the mounted desktop plugin. */
 async function start(): Promise<void> {
   if (!app.requestSingleInstanceLock()) {
@@ -601,6 +636,21 @@ async function start(): Promise<void> {
               },
             })
           },
+          exportRecoveryDiagnostics: async () => {
+            const diagnosticsPath = await exportDesktopDiagnostics(app.getPath('userData'), {
+              appVersion,
+              crashDumpsDir: app.getPath('crashDumps'),
+            })
+            electronLogger.error(`${BIN_NAME}: WSL recovery diagnostics saved: ${diagnosticsPath}`)
+          },
+          showProfileRestoreNotice: async profileName => {
+            await showProfileCheckpointRestoreNotice(
+              profileName,
+              desktopLocaleFromLanguageTag(app.getLocale()),
+              electronLogger,
+            )
+          },
+          showRecoveryFailure: async message => await chooseWslProfileRecoveryFailure(distribution, message),
           requestQuit,
         })
         generation.bindHost(host)

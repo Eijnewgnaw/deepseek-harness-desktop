@@ -24,6 +24,10 @@ export interface NativeDesktopControlBridgeOptions {
   pickDirectory(): Promise<string | null>
   validateDirectory(path: string): Promise<boolean>
   openTerminal(): void
+  exportRecoveryDiagnostics?(): Promise<void>
+  showProfileRestoreNotice?(profileName: string): Promise<void>
+  showRecoveryFailure?(message: string): Promise<'local' | 'quit'>
+  reportError?(operation: string, cause: unknown): void
 }
 
 function object(value: unknown, operation: string): Record<string, unknown> {
@@ -149,6 +153,7 @@ export class NativeDesktopControlBridge {
   private readonly releases: Array<() => void> = []
   private readonly tray = new Map<string, { value: RemoteTrayRegistration, registration: DesktopTrayItemRegistration }>()
   private shell: { id: string, release: () => Promise<void> } | undefined
+  private profileCreateSessionId: string | undefined
 
   constructor(
     private readonly peer: DesktopControlPeer,
@@ -200,21 +205,53 @@ export class NativeDesktopControlBridge {
       peer.register('native/tray.dispose', params => { this.disposeTray(params); return null }),
       peer.register('native/terminal.open', () => { options.openTerminal(); return null }),
       peer.register('native/diagnostics.export', async () => { await runtime.exportDiagnostics(); return null }),
+      peer.register('native/recovery.export-diagnostics', async () => {
+        if (options.exportRecoveryDiagnostics === undefined) {
+          throw new Error(`${BIN_NAME}: automatic recovery diagnostics are unavailable`)
+        }
+        await options.exportRecoveryDiagnostics()
+        return null
+      }),
+      peer.register('native/recovery.profile-restored', async params => {
+        if (options.showProfileRestoreNotice === undefined) {
+          throw new Error(`${BIN_NAME}: Profile restore notice is unavailable`)
+        }
+        await options.showProfileRestoreNotice(stringField(
+          object(params, 'Profile restore notice'),
+          'profileName',
+          'Profile restore notice',
+        ))
+        return null
+      }),
+      peer.register('native/recovery.failed', async params => {
+        if (options.showRecoveryFailure === undefined) {
+          throw new Error(`${BIN_NAME}: WSL recovery failure dialog is unavailable`)
+        }
+        return await options.showRecoveryFailure(stringField(
+          object(params, 'WSL recovery failure'),
+          'message',
+          'WSL recovery failure',
+        ))
+      }),
       peer.register('native/directory.pick', async () => await options.pickDirectory()),
       peer.register('native/directory.validate', async params => {
         const record = object(params, 'directory validation')
         return await options.validateDirectory(stringField(record, 'path', 'directory validation'))
       }),
-      peer.register('native/prompt.text', async params => {
-        const record = object(params, 'text prompt')
-        const defaultValue = record.defaultValue
-        if (defaultValue !== undefined && typeof defaultValue !== 'string') {
-          throw new Error(`${BIN_NAME}: invalid text prompt request`)
-        }
-        return await runtime.promptText(
-          stringField(record, 'title', 'text prompt'),
-          defaultValue as string | undefined,
+      peer.register('native/profile-create.open', params => {
+        this.profileCreateSessionId = stringField(
+          object(params, 'Profile creator'),
+          'id',
+          'Profile creator',
         )
+        runtime.openProfileCreateWindow({
+          onSubmit: async name => {
+            const id = this.profileCreateSessionId
+            if (id === undefined) throw new Error(`${BIN_NAME}: Profile creator session is unavailable`)
+            await peer.call('host/profile-create.submit', { id, name })
+          },
+        })
+        return null
       }),
       peer.register('native/renderer.report', params => { runtime.reportRendererBoot(params as RendererBootReport); return null }),
       peer.register('native/locale.set', params => {
@@ -233,7 +270,17 @@ export class NativeDesktopControlBridge {
         runtime.setThemeSource(source as DesktopThemeSource)
         return null
       }),
-      peer.register('native/runtime.restart', async () => { await runtime.requestRestart(); return null }),
+      peer.register('native/runtime.restart', () => {
+        // Acknowledge before shutdown starts. The Windows shutdown owns this
+        // WSL child and waits for it to exit, so awaiting it here would create
+        // a transport-level shutdown cycle.
+        setImmediate(() => {
+          void runtime.requestRestart().catch(cause => {
+            options.reportError?.('WSL Host restart', cause)
+          })
+        })
+        return null
+      }),
       peer.register('native/runtime.prepare-to-quit', () => { runtime.prepareToQuit(); return null }),
       peer.register('native/notification.show', params => {
         const record = object(params, 'notification')
@@ -325,6 +372,7 @@ export class NativeDesktopControlBridge {
 
   /** Release native resources before the control peer or child process exits. */
   async dispose(): Promise<void> {
+    this.profileCreateSessionId = undefined
     for (const release of this.releases.splice(0).reverse()) release()
     for (const item of this.tray.values()) item.registration.dispose()
     this.tray.clear()

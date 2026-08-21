@@ -15,7 +15,7 @@ import { DesktopActionsService } from './desktop-actions.ts'
 import {
   installDesktopPnpmRuntime,
 } from './desktop-runtime-environment.ts'
-import { DesktopPluginsService } from './desktop-plugins.ts'
+import { clearDesktopProfilePluginState, DesktopPluginsService } from './desktop-plugins.ts'
 import DesktopSettingsController from './desktop-settings-controller.ts'
 import {
   desktopMarketSnapshotWithEffective,
@@ -33,13 +33,17 @@ import { packagedDependencyPath } from './packaged-runtime-path.ts'
 import type { DesktopPnpmBootstrap } from './pnpm.ts'
 import {
   beginDesktopProfileStartup,
+  canDeleteDesktopProfile,
   createDesktopWebProfile,
+  deleteDesktopProfile,
   listDesktopProfiles,
   readDesktopProfileState,
   selectDesktopProfile,
 } from './profile-manager.ts'
 import { DesktopProfileService } from './profile-service.ts'
-import { DesktopProfileCheckpoint } from './profile-checkpoint.ts'
+import { clearDesktopProfileCheckpoint, DesktopProfileCheckpoint } from './profile-checkpoint.ts'
+import { materializeProfile, ProfileMaterializationError } from './profile-materializer.ts'
+import { maskSecrets } from './mask-secrets.ts'
 import {
   desktopInstallAnchor,
   prepareDesktopProfile,
@@ -224,6 +228,58 @@ export async function runWslHost(
       quiesceForRecovery: () => generation.quiesceForRecovery(),
       logger,
     })
+    startupStateCommit.observeInstallRecoveryClaim(recoveryClaim)
+    const restoreProfileCheckpoint = async (
+      checkpoint: DesktopProfileCheckpoint,
+      profileName: string,
+      profileDir: string,
+      attemptId: string,
+      forceMaterialization = false,
+    ): Promise<boolean> => {
+      const inspection = checkpoint.inspectRestore(attemptId)
+      if (!inspection.snapshotExists || inspection.restoreAttempted
+        || (!inspection.currentDiffers && !forceMaterialization)) return false
+      try {
+        await peer.call('native/recovery.export-diagnostics')
+      } catch (cause) {
+        stderr(
+          `${BIN_NAME}: failed to export diagnostics before Profile restore: ${cause instanceof Error ? cause.message : String(cause)}`,
+        )
+      }
+      const restored = checkpoint.restoreLatest(attemptId)
+      if (restored.status !== 'restored') return false
+      const dependencyFilesChanged = restored.changedFiles.some(name =>
+        name === 'package.json' || name === 'pnpm-lock.yaml' || name === 'pnpm-workspace.yaml')
+      if (dependencyFilesChanged || forceMaterialization) {
+        try {
+          await materializeProfile({
+            runtime: 'node',
+            appExecutable: process.execPath,
+            clearEnvironmentPath: pnpmRuntime.clearEnvironmentPath,
+            pnpmBinPath,
+            nodeBinDir: pnpmRuntime.nodeBinDir,
+            nodeShimPath: pnpmRuntime.nodeShimPath,
+            homeDir: options.homeDir,
+            profileDir,
+            electronVersion: process.versions.node,
+          })
+        } catch (materializationCause) {
+          const detail = materializationCause instanceof ProfileMaterializationError
+            ? materializationCause.result?.stderr || materializationCause.message
+            : materializationCause instanceof Error ? materializationCause.message : String(materializationCause)
+          stderr(`${BIN_NAME}: restored Profile dependency synchronization failed: ${maskSecrets(detail)}`)
+          return false
+        }
+      }
+      try {
+        await peer.call('native/recovery.profile-restored', { profileName })
+      } catch (cause) {
+        stderr(
+          `${BIN_NAME}: failed to show Profile restore notice: ${cause instanceof Error ? cause.message : String(cause)}`,
+        )
+      }
+      return true
+    }
     let logSink: LogFileSink | undefined
     try {
       logSink = new LogFileSink(join(options.stateDir, 'logs'), {
@@ -238,6 +294,7 @@ export async function runWslHost(
     }
     const environment = loadLayeredEnv(BIN_NAME, process.cwd())
     const releaseResolver = installProfilePackageResolver(prepared.bareModuleBaseUrl)
+    let profileRollbackPrepared = false
     const ctx = await boot(
       BIN_NAME,
       prepared.rootConfig,
@@ -267,6 +324,22 @@ export async function runWslHost(
           current: { name: activeProfileName, dir: prepared.profile.dir },
           create: name => createDesktopWebProfile(options.homeDir, name),
           list: () => listDesktopProfiles(options.homeDir),
+          canDelete: name => canDeleteDesktopProfile({
+            home: options.homeDir,
+            selectionStatePath,
+            currentProfileName: activeProfileName,
+          }, name),
+          delete: name => deleteDesktopProfile({
+            home: options.homeDir,
+            selectionStatePath,
+            currentProfileName: activeProfileName,
+            installRecovery,
+            clearDisabledState: () => clearDesktopProfilePluginState(pluginStatePath, name),
+            clearCheckpoint: () => clearDesktopProfileCheckpoint(
+              options.stateDir,
+              resolveProfileDir(name, options.homeDir),
+            ),
+          }, name),
           persistSelection: name => { selectDesktopProfile(selectionStatePath, options.homeDir, name) },
           requestRestart: async () => { await runtime?.requestRestart() },
         })
@@ -284,6 +357,81 @@ export async function runWslHost(
           readDesktopMarketStateForUserData(marketStateDir),
           prepared.market.effective,
         )
+        const prepareProfileRollback = () => {
+          if (profileRollbackPrepared) {
+            throw new Error(`${BIN_NAME}: a last-known-good Profile restore is already pending`)
+          }
+          const selection = readDesktopProfileState(selectionStatePath)
+          if (selection.active !== activeProfileName) {
+            throw new Error(`${BIN_NAME}: active Profile changed before recovery`)
+          }
+          const targetProfile = selection.lastKnownGood
+          const target = listDesktopProfiles(options.homeDir).find(candidate => candidate.name === targetProfile)
+          if (target === undefined || !target.webCapable || target.problem !== undefined) {
+            throw new Error(`${BIN_NAME}: last-known-good Profile is unavailable`)
+          }
+          const targetDir = resolveProfileDir(targetProfile, options.homeDir)
+          let targetCheckpoint: DesktopProfileCheckpoint | undefined
+          if (target.exists) {
+            targetCheckpoint = targetProfile === activeProfileName && profileCheckpoint !== undefined
+              ? profileCheckpoint
+              : new DesktopProfileCheckpoint({
+                  userDataDir: options.stateDir,
+                  profileDir: targetDir,
+                  profileName: targetProfile,
+                  provider: 'desktop-profile-wsl',
+                })
+          }
+          if (targetCheckpoint === undefined || !targetCheckpoint.inspectRestore().snapshotExists) {
+            throw new Error(`${BIN_NAME}: no healthy configuration snapshot is available`)
+          }
+          profileRollbackPrepared = true
+          return Object.freeze({
+            response: Object.freeze({
+              accepted: true as const,
+              restartRequired: true as const,
+              targetProfile,
+            }),
+            afterResponse: () => {
+              void (async () => {
+                const fresh = readDesktopProfileState(selectionStatePath)
+                if (fresh.active !== activeProfileName || fresh.lastKnownGood !== targetProfile) {
+                  throw new Error(`${BIN_NAME}: Profile selection changed before recovery`)
+                }
+                if (!await generation.quiesceForRecovery()) {
+                  throw new Error(`${BIN_NAME}: Host could not be stopped safely for Profile recovery`)
+                }
+                const restored = await restoreProfileCheckpoint(
+                  targetCheckpoint,
+                  targetProfile,
+                  targetDir,
+                  `manual-${generation.id}`,
+                  true,
+                )
+                if (!restored) throw new Error(`${BIN_NAME}: healthy Profile snapshot was not restored`)
+                startupStateCommit.restoreLastKnownGoodProfile()
+                await (runtime as RemoteDesktopRuntime).requestRestart()
+              })().catch(async (cause: unknown) => {
+                const detail = cause instanceof Error ? cause.message : String(cause)
+                stderr(`${BIN_NAME}: explicit last-known-good Profile restore failed: ${maskSecrets(detail)}`)
+                try {
+                  const action = await peer.call('native/recovery.failed', { message: detail })
+                  if (action === 'local') {
+                    await (runtime as RemoteDesktopRuntime).selectHostTarget({ mode: 'local' })
+                    await (runtime as RemoteDesktopRuntime).requestRestart()
+                  } else {
+                    peer.notify('host/exit', { code: 1 })
+                  }
+                } catch (recoveryCause) {
+                  stderr(
+                    `${BIN_NAME}: native recovery failure handling failed: ${recoveryCause instanceof Error ? recoveryCause.message : String(recoveryCause)}`,
+                  )
+                  peer.notify('host/exit', { code: 1 })
+                }
+              })
+            },
+          })
+        }
         hostCtx.provide('desktopSettingsController', new DesktopSettingsController({
           profiles: hostCtx.desktopProfiles,
           readHostTarget: () => (runtime as RemoteDesktopRuntime).hostTarget,
@@ -298,6 +446,16 @@ export async function runWslHost(
           ),
           scheduleRestart,
           openTerminal: () => { runtime?.openTerminal() },
+          exportDiagnostics: async () => { await runtime?.exportDiagnostics() },
+          openProfileCreator: () => {
+            runtime?.openProfileCreateWindow({
+              onSubmit: async name => {
+                hostCtx.desktopProfiles.create(name)
+                await hostCtx.desktopProfiles.select(name)
+              },
+            })
+          },
+          prepareProfileRollback,
         }))
         provideCmdline(hostCtx, {
           args: ['--host', '127.0.0.1', '--port', String(prepared.port)],

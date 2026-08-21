@@ -153,6 +153,10 @@ export class RemoteDesktopRuntime implements DesktopRuntime {
   private shell: { id: string, spec: DesktopShellSpec, scheduled: Promise<unknown> } | undefined
   private currentHostTarget: DesktopHostTargetView
   private readonly trayItems = new Map<string, DesktopTrayItem>()
+  private profileCreateSession: {
+    readonly id: string
+    readonly onSubmit: Parameters<DesktopRuntime['openProfileCreateWindow']>[0]['onSubmit']
+  } | undefined
   private readonly releases: Array<() => void> = []
 
   static async connect(
@@ -227,6 +231,21 @@ export class RemoteDesktopRuntime implements DesktopRuntime {
           await command.invoke()
 
         }
+        return null
+      }),
+      peer.register('host/profile-create.submit', async params => {
+        if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+          throw new Error(`${BIN_NAME}: invalid Profile creation submission`)
+        }
+        const { id, name } = params as { id?: unknown, name?: unknown }
+        const session = this.profileCreateSession
+        if (typeof id !== 'string' || id.length === 0 || id.length > 128
+          || typeof name !== 'string' || name.length === 0 || Buffer.byteLength(name, 'utf8') > 1024
+          || name.includes('\0') || session?.id !== id) {
+          throw new Error(`${BIN_NAME}: invalid Profile creation submission`)
+        }
+        await session.onSubmit(name)
+        if (this.profileCreateSession === session) this.profileCreateSession = undefined
         return null
       }),
     )
@@ -332,11 +351,10 @@ export class RemoteDesktopRuntime implements DesktopRuntime {
     return responseNullableString(await this.peer.call('native/directory.pick'), 'directory picker')
   }
 
-  async promptText(title: string, defaultValue?: string): Promise<string | null> {
-    return responseNullableString(
-      await this.peer.call('native/prompt.text', { title, ...(defaultValue === undefined ? {} : { defaultValue }) }),
-      'text prompt',
-    )
+  openProfileCreateWindow(options: Parameters<DesktopRuntime['openProfileCreateWindow']>[0]): void {
+    const id = randomUUID()
+    this.profileCreateSession = { id, onSubmit: options.onSubmit }
+    this.peer.notify('native/profile-create.open', { id })
   }
 
   async validateDirectory(path: string): Promise<boolean> {
@@ -363,6 +381,7 @@ export class RemoteDesktopRuntime implements DesktopRuntime {
   /** Remove peer method registrations owned by this proxy. */
   dispose(): void {
     for (const release of this.releases.splice(0).reverse()) release()
+    this.profileCreateSession = undefined
     this.trayItems.clear()
   }
 }

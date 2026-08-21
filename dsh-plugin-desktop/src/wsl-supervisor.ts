@@ -128,6 +128,9 @@ export interface WslHostSupervisorOptions {
   pickDirectory(runtime: WslManagedRuntime): Promise<string | null>
   validateDirectory(runtime: WslManagedRuntime, path: string): Promise<boolean>
   openTerminal(runtime: WslManagedRuntime, ready: WslHostReady): void
+  exportRecoveryDiagnostics(): Promise<void>
+  showProfileRestoreNotice(profileName: string): Promise<void>
+  showRecoveryFailure(message: string): Promise<'local' | 'quit'>
   requestQuit(code: number): void
 }
 
@@ -419,6 +422,14 @@ export async function startWslHost(options: WslHostSupervisorOptions): Promise<W
     openTerminal: () => {
       if (currentReady === undefined) throw new Error(`${BIN_NAME}: WSL Host terminal is not ready`)
       options.openTerminal(managedRuntime, currentReady)
+    },
+    exportRecoveryDiagnostics: options.exportRecoveryDiagnostics,
+    showProfileRestoreNotice: options.showProfileRestoreNotice,
+    showRecoveryFailure: options.showRecoveryFailure,
+    reportError: (operation, cause) => {
+      options.logger.error(
+        `${BIN_NAME}: ${operation} failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      )
     },
   })
   child.stderr.on('data', (chunk: Buffer | string) => {

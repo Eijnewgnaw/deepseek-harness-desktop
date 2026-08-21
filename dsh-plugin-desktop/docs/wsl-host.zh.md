@@ -106,6 +106,7 @@ Windows 文件夹选择器只接受被选发行版的 UNC 共享：
 - 窗口显示、隐藏、聚焦和 Renderer URL 挂载；
 - 托盘项目与原生菜单动作；
 - 目录选择和确认对话框；
+- 隔离的 Profile 创建器、诊断隐私流程与恢复对话框；
 - 通知、角标和任务栏提醒；
 - 主题外观；
 - 更新检查、下载和安装器交接；
@@ -124,7 +125,9 @@ Windows 侧拥有真实 Electron 对象；WSL 侧拥有 DSH、Profile、插件�
 
 如果子进程在第 4 步前退出，选择不会被提交。原生恢复对话框会提供“切回本机 Host 并重启”或“退出”。WSL Profile 和数据都会保留。健康状态提交后，如果 WSL Host 意外退出，Windows 应用会有序关闭，而不会留下一个看似仍在运行的空壳。
 
-正常退出按相反方向进行：Windows 发送有时限的 shutdown 请求，WSL Host 释放 Cordis generation，Windows 等待 `wsl.exe` 退出。超时路径有明确的 kill/exit 回退，防止任何一边无限期遗留另一边。
+越过健康门时，WSL 会像本机 Host 一样保存一份有大小限制的 Profile 配置检查点。用户显式请求**恢复最近一次成功的 Profile**时，系统先校验当前选择与 last-known-good，向页面返回已经接受的响应，然后停止 Cordis 树，再修改文件。Windows 会在不上传的前提下保存恢复诊断；WSL 恢复已封存的检查点，并针对 Linux Node ABI 执行 `pnpm install --frozen-lockfile`，成功后才提交选择并重启。如果恢复失败，错误仍由 Windows 原生恢复界面处理，并可安全切回本机 Host。非活动的 WSL Profile 也使用与本机 Profile 相同的选择状态、安装恢复事务、插件状态和检查点保护来删除。
+
+正常退出按相反方向进行：Windows 发送有时限的 shutdown 请求，WSL Host 释放 Cordis generation，Windows 等待 `wsl.exe` 退出。Host 主动请求重启时，控制通道会先确认接收，再让 Windows 开始关闭，避免双方互相等待。超时路径有明确的 kill/exit 回退，防止任何一边无限期遗留另一边。
 
 ## 安全边界
 

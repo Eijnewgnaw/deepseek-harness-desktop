@@ -106,6 +106,7 @@ Plugins still see the ordinary `desktopRuntime` capability. A WSL-side proxy for
 - window show/hide/focus and renderer URL mounting;
 - tray items and native menu actions;
 - directory and confirmation dialogs;
+- the isolated Profile creator, diagnostics privacy flow, and recovery dialogs;
 - notifications, badges, and taskbar attention;
 - theme appearance;
 - update checks, downloads, and installer handoff;
@@ -124,7 +125,9 @@ Startup follows a two-phase health rule:
 
 If the child exits before step 4, the selection is not committed. A native recovery dialog offers to switch to the Local Host and relaunch, or quit. WSL profiles and data are preserved. After health is committed, an unexpected WSL Host exit requests an orderly Windows application shutdown instead of leaving a misleading empty shell.
 
-Normal quit works in the opposite direction: Windows sends a bounded shutdown request, the WSL Host releases the Cordis generation, and Windows waits for `wsl.exe` to exit. Timeouts have explicit kill/exit fallbacks so neither side can indefinitely orphan the other.
+At the health gate, WSL captures the same bounded Profile configuration checkpoint as the Local Host. An explicit **Restore last successful Profile** request first validates the current and last-known-good selections, sends the HTTP acceptance response, then quiesces the Cordis tree before changing files. Windows saves recovery diagnostics without uploading them; WSL restores the sealed checkpoint and runs `pnpm install --frozen-lockfile` against the Linux Node ABI before committing the selection and restarting. A failure stays on the native recovery surface and offers a safe switch back to the Local Host. Inactive WSL Profiles can also be deleted through the same selection, install-recovery, plugin-state, and checkpoint guards as Local Profiles.
+
+Normal quit works in the opposite direction: Windows sends a bounded shutdown request, the WSL Host releases the Cordis generation, and Windows waits for `wsl.exe` to exit. A Host-initiated restart is acknowledged on the control channel before Windows begins that shutdown, avoiding a circular wait. Timeouts have explicit kill/exit fallbacks so neither side can indefinitely orphan the other.
 
 ## Security boundary
 

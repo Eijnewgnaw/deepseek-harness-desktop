@@ -156,4 +156,113 @@ describe('remote Desktop runtime', () => {
     control.host.close()
     control.native.close()
   })
+
+  it('submits the isolated native Profile creator through its active Host session', async () => {
+    const control = pair()
+    let nativeSubmit: ((name: string) => void | Promise<void>) | undefined
+    const openProfileCreateWindow = vi.fn((options: {
+      onSubmit(name: string): void | Promise<void>
+    }) => { nativeSubmit = options.onSubmit })
+    const nativeRuntime = {
+      platform: 'win32',
+      locale: 'en',
+      updates: {
+        isPackaged: true,
+        canDownload: false,
+        currentVersion: '2.0.2',
+      },
+      openProfileCreateWindow,
+    } as unknown as DesktopRuntime
+    const bridge = new NativeDesktopControlBridge(control.native, {
+      runtime: nativeRuntime,
+      pickDirectory: vi.fn(async () => null),
+      validateDirectory: vi.fn(async () => false),
+      openTerminal: vi.fn(),
+    })
+    const runtime = await RemoteDesktopRuntime.connect(control.host, '/home/alice/update-state.json')
+    const onSubmit = vi.fn(async (name: string) => {
+      if (name === 'occupied') throw new Error('Profile already exists')
+    })
+
+    runtime.openProfileCreateWindow({ onSubmit })
+    await vi.waitFor(() => { expect(openProfileCreateWindow).toHaveBeenCalledOnce() })
+    await expect(nativeSubmit?.('occupied')).rejects.toThrow('Profile already exists')
+    await expect(nativeSubmit?.('work')).resolves.toBeUndefined()
+    expect(onSubmit).toHaveBeenNthCalledWith(1, 'occupied')
+    expect(onSubmit).toHaveBeenNthCalledWith(2, 'work')
+
+    runtime.dispose()
+    await bridge.dispose()
+    control.host.close()
+    control.native.close()
+  })
+
+  it('acknowledges a WSL restart before the Windows shutdown promise settles', async () => {
+    const control = pair()
+    let settleRestart!: () => void
+    const pendingRestart = new Promise<void>(resolve => { settleRestart = resolve })
+    const requestRestart = vi.fn(() => pendingRestart)
+    const nativeRuntime = {
+      platform: 'win32',
+      locale: 'en',
+      updates: {
+        isPackaged: true,
+        canDownload: false,
+        currentVersion: '2.0.2',
+      },
+      requestRestart,
+    } as unknown as DesktopRuntime
+    const bridge = new NativeDesktopControlBridge(control.native, {
+      runtime: nativeRuntime,
+      pickDirectory: vi.fn(async () => null),
+      validateDirectory: vi.fn(async () => false),
+      openTerminal: vi.fn(),
+    })
+    const runtime = await RemoteDesktopRuntime.connect(control.host, '/home/alice/update-state.json')
+
+    await expect(runtime.requestRestart()).resolves.toBeUndefined()
+    await vi.waitFor(() => { expect(requestRestart).toHaveBeenCalledOnce() })
+    settleRestart()
+
+    runtime.dispose()
+    await bridge.dispose()
+    control.host.close()
+    control.native.close()
+  })
+
+  it('keeps automatic WSL recovery diagnostics and dialogs on the native side', async () => {
+    const control = pair()
+    const exportRecoveryDiagnostics = vi.fn(async () => {})
+    const showProfileRestoreNotice = vi.fn(async () => {})
+    const showRecoveryFailure = vi.fn(async () => 'local' as const)
+    const nativeRuntime = {
+      platform: 'win32',
+      locale: 'zh',
+      updates: {
+        isPackaged: true,
+        canDownload: false,
+        currentVersion: '2.0.2',
+      },
+    } as unknown as DesktopRuntime
+    const bridge = new NativeDesktopControlBridge(control.native, {
+      runtime: nativeRuntime,
+      pickDirectory: vi.fn(async () => null),
+      validateDirectory: vi.fn(async () => false),
+      openTerminal: vi.fn(),
+      exportRecoveryDiagnostics,
+      showProfileRestoreNotice,
+      showRecoveryFailure,
+    })
+
+    await expect(control.host.call('native/recovery.export-diagnostics')).resolves.toBeNull()
+    await expect(control.host.call('native/recovery.profile-restored', { profileName: 'work' })).resolves.toBeNull()
+    await expect(control.host.call('native/recovery.failed', { message: 'pnpm failed' })).resolves.toBe('local')
+    expect(exportRecoveryDiagnostics).toHaveBeenCalledOnce()
+    expect(showProfileRestoreNotice).toHaveBeenCalledWith('work')
+    expect(showRecoveryFailure).toHaveBeenCalledWith('pnpm failed')
+
+    await bridge.dispose()
+    control.host.close()
+    control.native.close()
+  })
 })
