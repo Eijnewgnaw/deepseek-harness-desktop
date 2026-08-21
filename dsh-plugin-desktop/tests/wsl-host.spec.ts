@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
-import { parseWslHostArguments, reserveControlOutput } from '../src/wsl-host.ts'
+import {
+  acceptWslHostShutdown,
+  parseWslHostArguments,
+  reserveControlOutput,
+} from '../src/wsl-host.ts'
 
 describe('WSL Host bootstrap arguments', () => {
   it('preserves the inherited stdout descriptor for control frames', () => {
@@ -34,5 +38,23 @@ describe('WSL Host bootstrap arguments', () => {
     expect(() => parseWslHostArguments([
       '--state-dir', '/state', '--home-dir', '/home/a', '--profile', 'desktop',
     ])).toThrow('unknown or repeated')
+  })
+
+  it('keeps shutdown pending until generation effects release on the live channel', async () => {
+    let finishRelease!: () => void
+    const release = vi.fn(() => new Promise<void>(resolve => { finishRelease = resolve }))
+    const setExitCode = vi.fn()
+    let settled = false
+    const operation = acceptWslHostShutdown({ code: 7 }, release, setExitCode)
+      .then(result => { settled = true; return result })
+
+    await Promise.resolve()
+    expect(release).toHaveBeenCalledOnce()
+    expect(setExitCode).toHaveBeenCalledWith(7)
+    expect(settled).toBe(false)
+    finishRelease()
+    await expect(operation).resolves.toBeNull()
+    await expect(acceptWslHostShutdown({ code: 1.5 }, release, setExitCode))
+      .rejects.toThrow('invalid shutdown code')
   })
 })

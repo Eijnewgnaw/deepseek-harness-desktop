@@ -107,6 +107,23 @@ interface WslHostErrorOutput {
   write: typeof process.stderr.write
 }
 
+/** Keep the control response pending until all Host effects have stopped. */
+export async function acceptWslHostShutdown(
+  params: unknown,
+  releaseGeneration: () => Promise<void>,
+  setExitCode: (code: number) => void,
+): Promise<null> {
+  const requested = params !== null && typeof params === 'object'
+    ? (params as { code?: unknown }).code
+    : undefined
+  if (requested !== undefined && !Number.isSafeInteger(requested)) {
+    throw new Error(`${BIN_NAME}: invalid shutdown code`)
+  }
+  setExitCode(typeof requested === 'number' ? requested : 0)
+  await releaseGeneration()
+  return null
+}
+
 /** Keep stdout protocol-only even if a third-party Host plugin writes a notice. */
 export function reserveControlOutput(
   stdout: WslHostOutputDescriptor = process.stdout,
@@ -142,12 +159,14 @@ export async function runWslHost(
   let exitCode = 0
   let settle!: () => void
   const stopped = new Promise<void>(resolve => { settle = resolve })
-  const releaseGeneration = (): void => {
-    void generation.release().catch(cause => {
+  let releaseTask: Promise<void> | undefined
+  const releaseGeneration = (): Promise<void> => {
+    releaseTask ??= generation.release().catch(cause => {
       stderr(`${BIN_NAME}: failed to release Host generation: ${cause instanceof Error ? cause.message : String(cause)}`)
-    }).finally(settle)
+    })
+    return releaseTask
   }
-  const releaseOnEnd = (): void => { releaseGeneration() }
+  const releaseOnEnd = (): void => { void releaseGeneration().finally(settle) }
   input.once('end', releaseOnEnd)
   try {
     const selectionStatePath = join(options.stateDir, 'profile-selection', 'state.json')
@@ -487,18 +506,11 @@ export async function runWslHost(
       healthyCommitted = true
       return null
     })
-    const removeShutdown = peer.register('host/shutdown', async params => {
-      const requested = params !== null && typeof params === 'object'
-        ? (params as { code?: unknown }).code
-        : undefined
-      if (requested !== undefined && !Number.isSafeInteger(requested)) {
-        throw new Error(`${BIN_NAME}: invalid shutdown code`)
-      }
-      exitCode = typeof requested === 'number' ? requested : 0
-      // Acknowledge before releasing the transport that must carry this response.
-      releaseGeneration()
-      return null
-    })
+    const removeShutdown = peer.register('host/shutdown', async params => await acceptWslHostShutdown(
+      params,
+      releaseGeneration,
+      code => { exitCode = code },
+    ))
     generation.own(removeHealthy)
     generation.own(removeShutdown)
     peer.notify('host/ready', {
