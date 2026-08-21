@@ -91,7 +91,7 @@ describe('packaged desktop runtime verification', () => {
     },
   )
 
-  it('runs the static package gate before the diagnostic Worker smoke', async () => {
+  it('prepares the WSL payload before the static package gate and diagnostic Worker smoke', async () => {
     const runtimeContext = context('/build', 'win32')
     const calls: string[] = []
 
@@ -99,9 +99,10 @@ describe('packaged desktop runtime verification', () => {
       runtimeContext,
       () => { calls.push('static') },
       async (unpackedRoot) => { calls.push(unpackedRoot) },
+      async () => { calls.push('wsl') },
     )
 
-    expect(calls).toEqual(['static', resolvePackagedUnpackedRoot(runtimeContext)])
+    expect(calls).toEqual(['wsl', 'static', resolvePackagedUnpackedRoot(runtimeContext)])
   })
 
   it('tracks the ConPTY-only native surface shipped by node-pty 1.2', () => {

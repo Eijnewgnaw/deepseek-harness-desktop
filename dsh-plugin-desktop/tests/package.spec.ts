@@ -642,6 +642,8 @@ describe('published package surface', () => {
     expect(manifest.scripts?.['check:win-package']).toContain('tests/update-checker.spec.ts')
     expect(manifest.scripts?.['check:win-package']).toContain('tests/update-download.spec.ts')
     expect(manifest.scripts?.['check:win-package']).toContain('tests/windows-volume-diagnostics.spec.ts')
+    expect(manifest.scripts?.['check:win-package']).toContain('tests/wsl-runtime-bundle.spec.ts')
+    expect(manifest.scripts?.['check:win-package']).toContain('tests/wsl-supervisor.spec.ts')
     expect(manifest.scripts?.['check:win-package']).toContain('yarn run verify:closure')
     expect(manifest.scripts?.['check:mac-package']).toContain('yarn workspace dsh-community-market build')
     expect(manifest.scripts?.['check:mac-package']).toContain('yarn run build')

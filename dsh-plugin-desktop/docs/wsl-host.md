@@ -38,6 +38,7 @@ The browser page is still the ordinary DSH Web application. WSL exposes the Host
 | Health gate | The point at which the Host, Web page, and native window have all started successfully. Only then is a pending profile/target committed as known-good. |
 | Distribution | One installed WSL Linux environment, for example `Ubuntu-24.04`. |
 | ext4 storage | WSL's native Linux filesystem. It preserves Linux paths, permissions, links, and file-watching behavior better than `/mnt/c`. |
+| Runtime bundle | A Windows-packaged directory containing the exact Desktop, Market, patched first-party archives, npm lockfile, and SHA-256 manifest used to provision WSL. |
 
 ## Requirements
 
@@ -68,11 +69,11 @@ All three commands must work without first sourcing an interactive shell file. V
 
 The choice applies to the next complete generation. DSH Desktop never moves a live Cordis tree between operating systems.
 
-On a source checkout, a WSL launch also requires `DSH_DESKTOP_WSL_PACKAGE_SPEC` to identify the exact locally built npm archive. Packaged releases automatically request `dsh-plugin-desktop@<application-version>`.
+On a source checkout, a WSL launch also requires `DSH_DESKTOP_WSL_BUNDLE_DIR` to identify a prepared runtime bundle. Packaged Windows releases carry the verified bundle under `resources/wsl-runtime` and do not depend on unpublished Desktop or Market package versions being available from npm.
 
 ## First-run provisioning and storage
 
-DSH Desktop probes the selected distribution, then installs the exact desktop package version into an application-owned runtime prefix. Installation is shell-free, version-checked, and repeated only when that version is absent or invalid.
+DSH Desktop probes the selected distribution, verifies every bundled byte on Windows, translates the bundle location with `wslpath`, and copies it into a unique staging directory on WSL's Linux filesystem. `npm ci` installs only the sealed lockfile graph. The staged Host version and manifest fingerprint are checked before an atomic directory rename makes it active; the previous runtime remains available for rollback until the new tree passes final verification. Provisioning is repeated only when that exact fingerprint is absent or invalid.
 
 Managed paths are below the Linux user's home directory:
 
@@ -134,6 +135,7 @@ Normal quit works in the opposite direction: Windows sends a bounded shutdown re
 - WSL distribution names are validated and must come from current WSL 2 discovery.
 - Workspace admission is confined to the selected distribution and revalidated in Linux.
 - The WSL Host package version must exactly match the Windows desktop version.
+- The package graph is pinned by `package-lock.json`; local and patched archives plus package metadata are sealed by a SHA-256 manifest before crossing into WSL.
 - WSL stderr is mirrored into the Windows application log so startup and runtime failures appear in normal diagnostics.
 
 The control channel is a trusted internal capability boundary between two processes launched and owned by the same desktop generation. It is not a general remote-Host API and is deliberately not exported as a public package subpath.
@@ -151,20 +153,23 @@ corepack yarn workspace dsh-plugin-desktop verify:closure
 
 The package build emits the private `lib/wsl-host.js` entry. Packaging verification requires that entry and its complete runtime closure in the application archive, but `package.json` intentionally does not export `./wsl-host`.
 
-To test a source build, first produce a package archive, copy or place it somewhere visible inside WSL, and set the Windows launch environment to that Linux-visible path:
+To test a source build, build both workspaces, generate the same verified bundle used by release packaging, and point the Windows process at its Windows directory:
 
 ```powershell
-$env:DSH_DESKTOP_WSL_PACKAGE_SPEC='/mnt/c/path/to/dsh-plugin-desktop-2.0.2.tgz'
-corepack.cmd yarn dev
+corepack.cmd yarn workspace dsh-community-market build
+corepack.cmd yarn workspace dsh-plugin-desktop build
+node .\dsh-plugin-desktop\scripts\wsl-runtime-bundle.ts .\dsh-plugin-desktop\build\wsl-runtime
+$env:DSH_DESKTOP_WSL_BUNDLE_DIR=(Resolve-Path .\dsh-plugin-desktop\build\wsl-runtime).Path
+node .\dsh-plugin-desktop\lib\bin.js
 ```
 
-The archive version must match the application version. This explicit variable prevents a development build from silently installing an unrelated published package.
+The bundle version and every recorded hash must match the application version. This explicit variable prevents a development build from silently installing an unrelated or stale package graph.
 
 ## Troubleshooting
 
 - **No distribution appears:** confirm `wsl --list --verbose` reports version `2`, then restart DSH Desktop.
 - **Node.js prerequisite error:** run the three PowerShell checks above. A Node binary available only after `source ~/.nvm/nvm.sh` is not visible to the managed launcher.
-- **Provisioning fails:** check npm registry/network access in the distribution and the Windows DSH Desktop log. The installer error is sanitized in the UI; detailed child stderr is logged.
+- **Provisioning fails:** check npm registry/network access in the distribution and the Windows DSH Desktop log. External dependencies are downloaded according to the bundled lockfile; unpublished first-party packages come from the bundle. The installer error is sanitized in the UI, while detailed child stderr is logged.
 - **Workspace is rejected:** choose a directory under `\\wsl.localhost\<selected-distribution>\...`, not `C:\...` or another distribution.
 - **Local data seems absent:** Local and WSL Hosts intentionally use separate DSH homes. Switch the Host location back; no automatic migration is performed.
 - **WSL Host exits after startup:** export normal Desktop diagnostics. WSL stderr is included in the Windows log files.

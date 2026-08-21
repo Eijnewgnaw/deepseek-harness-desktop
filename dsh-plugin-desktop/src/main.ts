@@ -556,10 +556,12 @@ async function start(): Promise<void> {
         if (!discoveredHostTargets.distributions.includes(distribution)) {
           throw new Error(`${BIN_NAME}: selected WSL 2 distribution is not available: ${distribution}`)
         }
-        const developmentPackageSpecifier = process.env.DSH_DESKTOP_WSL_PACKAGE_SPEC
-        if (!app.isPackaged && developmentPackageSpecifier === undefined) {
+        const runtimeBundlePath = app.isPackaged
+          ? join(process.resourcesPath, 'wsl-runtime')
+          : process.env.DSH_DESKTOP_WSL_BUNDLE_DIR
+        if (runtimeBundlePath === undefined) {
           throw new Error(
-            `${BIN_NAME}: source builds require DSH_DESKTOP_WSL_PACKAGE_SPEC to select a local package archive`,
+            `${BIN_NAME}: source builds require DSH_DESKTOP_WSL_BUNDLE_DIR to select a prepared runtime bundle`,
           )
         }
         startupStage = 'runtime-bootstrap'
@@ -574,8 +576,8 @@ async function start(): Promise<void> {
         const host = await startWslHost({
           distribution,
           productVersion: appVersion,
+          runtimeBundlePath,
           runtime,
-          ...(app.isPackaged ? {} : { packageSpecifier: developmentPackageSpecifier as string }),
           logger: electronLogger,
           pickDirectory: async managedRuntime => await workspaceFor(managedRuntime).pickDirectory(),
           validateDirectory: async (managedRuntime, path) => await workspaceFor(managedRuntime).validateDirectory(path),

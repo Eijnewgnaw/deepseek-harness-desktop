@@ -38,6 +38,7 @@ Windows                                      WSL 2 发行版
 | 健康门 | Host、Web 页面和原生窗口都成功启动的时刻。只有越过这道门，待定 Profile/Host 目标才会被记为“已知可用”。 |
 | 发行版 | 一个已经安装的 WSL Linux 环境，例如 `Ubuntu-24.04`。 |
 | ext4 存储 | WSL 原生 Linux 文件系统。它比 `/mnt/c` 更好地保持 Linux 路径、权限、链接、文件监听和性能语义。 |
+| 运行时 bundle | 随 Windows 应用打包的目录，包含精确版本的 Desktop、Market、第一方补丁归档、npm 锁文件和用于部署 WSL 的 SHA-256 清单。 |
 
 ## 前置条件
 
@@ -68,11 +69,11 @@ wsl -d Ubuntu-24.04 -- bash --version
 
 这个选择作用于下一个完整 generation。DSH Desktop 不会把正在运行的 Cordis 树在两个操作系统之间热迁移。
 
-从源码启动时，WSL 模式还要求用 `DSH_DESKTOP_WSL_PACKAGE_SPEC` 指定精确的本地 npm 包归档。正式安装包会自动请求 `dsh-plugin-desktop@<应用版本>`。
+从源码启动时，WSL 模式还要求用 `DSH_DESKTOP_WSL_BUNDLE_DIR` 指定预先生成的运行时 bundle。正式 Windows 安装包会把已校验 bundle 放在 `resources/wsl-runtime`，不依赖 npm 上是否发布了对应的 Desktop 或 Market 版本。
 
 ## 首次部署与数据位置
 
-DSH Desktop 会先探测发行版，然后把版本完全一致的 desktop package 安装到应用自有 runtime prefix。安装过程不经过 shell、会校验版本，并且只在该版本缺失或无效时重复执行。
+DSH Desktop 会先探测发行版、在 Windows 校验 bundle 的每个字节，再用 `wslpath` 转换路径，并把 bundle 复制到 WSL Linux 文件系统中的唯一 staging 目录。`npm ci` 只安装清单内锁定的依赖图。staging 中的 Host 版本与清单指纹通过校验后，才通过原子目录重命名成为当前 runtime；旧 runtime 会保留到新目录最终校验成功，以便失败时回滚。只有该精确指纹缺失或无效时才会重新部署。
 
 托管路径都位于 Linux 用户主目录下：
 
@@ -134,6 +135,7 @@ Windows 侧拥有真实 Electron 对象；WSL 侧拥有 DSH、Profile、插件�
 - WSL 发行版名称会被校验，并且必须来自当前 WSL 2 探测结果。
 - 工作区被限制在所选发行版内，并在 Linux 中再次验证。
 - WSL Host package 版本必须与 Windows desktop 版本完全一致。
+- package graph 由 `package-lock.json` 固定；本地与补丁归档以及 package metadata 在跨入 WSL 前都由 SHA-256 清单封存。
 - WSL stderr 会镜像到 Windows 应用日志，因此常规诊断可以看到启动和运行失败。
 
 控制通道是同一个 desktop generation 启动并拥有的两个进程之间的可信内部 capability 边界。它不是通用 Remote Host API，因此不会作为公开 package subpath 导出。
@@ -151,20 +153,23 @@ corepack yarn workspace dsh-plugin-desktop verify:closure
 
 package build 会生成私有 `lib/wsl-host.js` 入口。打包校验要求应用归档包含该入口及其完整 runtime closure，但 `package.json` 有意不导出 `./wsl-host`。
 
-测试源码构建时，先生成 package 归档，把它放在 WSL 可见位置，再把 Windows 启动环境指向这个 Linux 可见路径：
+测试源码构建时，先构建两个 workspace，生成与正式打包相同的校验 bundle，再让 Windows 进程指向这个 Windows 目录：
 
 ```powershell
-$env:DSH_DESKTOP_WSL_PACKAGE_SPEC='/mnt/c/path/to/dsh-plugin-desktop-2.0.2.tgz'
-corepack.cmd yarn dev
+corepack.cmd yarn workspace dsh-community-market build
+corepack.cmd yarn workspace dsh-plugin-desktop build
+node .\dsh-plugin-desktop\scripts\wsl-runtime-bundle.ts .\dsh-plugin-desktop\build\wsl-runtime
+$env:DSH_DESKTOP_WSL_BUNDLE_DIR=(Resolve-Path .\dsh-plugin-desktop\build\wsl-runtime).Path
+node .\dsh-plugin-desktop\lib\bin.js
 ```
 
-归档版本必须与应用版本相同。这个显式变量可以防止开发构建静默安装无关的线上 package。
+bundle 版本和清单中的每个 hash 都必须与应用版本匹配。这个显式变量可以防止开发构建静默安装无关或过期的 package graph。
 
 ## 故障排查
 
 - **没有发行版可选：**确认 `wsl --list --verbose` 报告的版本为 `2`，然后重启 DSH Desktop。
 - **Node.js 前置条件错误：**运行上面的三条 PowerShell 检查。只有执行 `source ~/.nvm/nvm.sh` 后才出现的 Node 对托管 launcher 不可见。
-- **部署失败：**检查发行版的 npm registry/网络访问和 Windows DSH Desktop 日志。UI 中的安装错误会被净化，详细子进程 stderr 会写入日志。
+- **部署失败：**检查发行版的 npm registry/网络访问和 Windows DSH Desktop 日志。外部依赖按 bundle 内的锁文件下载；未发布的第一方 package 直接来自 bundle。UI 中的安装错误会被净化，详细子进程 stderr 会写入日志。
 - **工作区被拒绝：**请选择 `\\wsl.localhost\<被选发行版>\...` 下的目录，不要选择 `C:\...` 或另一个发行版。
 - **看不到本机数据：**本机 Host 与 WSL Host 有意使用不同 DSH home。切回原 Host 即可；系统不会自动迁移数据。
 - **WSL Host 启动后退出：**导出普通 Desktop 诊断；Windows 日志文件中包含 WSL stderr。

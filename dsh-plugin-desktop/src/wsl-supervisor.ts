@@ -1,6 +1,7 @@
 /** Windows owner for provisioning and supervising one complete DSH Host in WSL. */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { join as joinPosix } from 'node:path/posix'
 import { DesktopControlPeer } from './control-protocol.ts'
 import { NativeDesktopControlBridge } from './native-control-bridge.ts'
@@ -12,8 +13,14 @@ import {
   probeWslHostPrerequisites,
   type DesktopCommandCapture,
   type WslHostPrerequisites,
+  windowsPathToWsl,
   wslExecArguments,
 } from './wsl.ts'
+import {
+  verifyWslRuntimeBundle,
+  WSL_RUNTIME_BUNDLE_MANIFEST,
+  type WslRuntimeBundle,
+} from './wsl-runtime-bundle.ts'
 
 const BIN_NAME = 'dsh-plugin-desktop'
 const DEFAULT_STARTUP_TIMEOUT_MS = 120_000
@@ -21,12 +28,67 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000
 const INSTALL_TIMEOUT_MS = 10 * 60_000
 const INSTALL_OUTPUT_LIMIT = 16 * 1024 * 1024
 const VERIFY_RUNTIME_SCRIPT = [
+  "const crypto = require('node:crypto')",
   "const fs = require('node:fs')",
   'try {',
   '  const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))',
   '  if (manifest.version !== process.argv[3]) process.exit(2)',
   '  fs.accessSync(process.argv[2], fs.constants.R_OK)',
+  '  const bundle = fs.readFileSync(process.argv[4])',
+  '  if (crypto.createHash("sha256").update(bundle).digest("hex") !== process.argv[5]) process.exit(2)',
   '} catch { process.exit(2) }',
+].join('; ')
+const COPY_BUNDLE_SCRIPT = [
+  "const crypto = require('node:crypto')",
+  "const fs = require('node:fs')",
+  "const path = require('node:path')",
+  'const source = process.argv[1]',
+  'const target = process.argv[2]',
+  'const expected = process.argv[3]',
+  'fs.rmSync(target, { recursive: true, force: true })',
+  'fs.mkdirSync(path.dirname(target), { recursive: true })',
+  'fs.cpSync(source, target, { recursive: true, errorOnExist: true, force: false })',
+  `const manifestPath = path.join(target, ${JSON.stringify(WSL_RUNTIME_BUNDLE_MANIFEST)})`,
+  'const manifestBytes = fs.readFileSync(manifestPath)',
+  'const digest = value => crypto.createHash("sha256").update(value).digest("hex")',
+  'if (digest(manifestBytes) !== expected) throw new Error("manifest hash changed")',
+  'const manifest = JSON.parse(manifestBytes)',
+  'for (const file of manifest.files) {',
+  '  const absolute = path.resolve(target, file.path)',
+  '  const relative = path.relative(target, absolute)',
+  '  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("bundle path escaped")',
+  '  const bytes = fs.readFileSync(absolute)',
+  '  if (bytes.length !== file.bytes || digest(bytes) !== file.sha256) throw new Error("bundle file changed")',
+  '}',
+].join('; ')
+const COMMIT_RUNTIME_SCRIPT = [
+  "const fs = require('node:fs')",
+  'const target = process.argv[1]',
+  'const staging = process.argv[2]',
+  'const backup = process.argv[3]',
+  'fs.rmSync(backup, { recursive: true, force: true })',
+  'const hadTarget = fs.existsSync(target)',
+  'if (hadTarget) fs.renameSync(target, backup)',
+  'try {',
+  '  fs.renameSync(staging, target)',
+  '} catch (cause) {',
+  '  if (hadTarget && !fs.existsSync(target)) fs.renameSync(backup, target)',
+  '  throw cause',
+  '}',
+].join('; ')
+const REMOVE_RUNTIME_SCRIPT = "require('node:fs').rmSync(process.argv[1], { recursive: true, force: true })"
+const RECOVER_RUNTIME_SCRIPT = [
+  "const fs = require('node:fs')",
+  'const target = process.argv[1]',
+  'const staging = process.argv[2]',
+  'const backup = process.argv[3]',
+  'if (fs.existsSync(backup)) {',
+  '  fs.rmSync(target, { recursive: true, force: true })',
+  '  fs.renameSync(backup, target)',
+  '} else if (!fs.existsSync(staging)) {',
+  '  fs.rmSync(target, { recursive: true, force: true })',
+  '}',
+  'fs.rmSync(staging, { recursive: true, force: true })',
 ].join('; ')
 
 export interface WslManagedRuntime {
@@ -56,8 +118,9 @@ export interface WslHostSupervisorOptions {
   readonly distribution: string
   readonly productVersion: string
   readonly runtime: DesktopRuntime
-  readonly packageSpecifier?: string
+  readonly runtimeBundlePath: string
   readonly capture?: DesktopCommandCapture
+  readonly verifyBundle?: typeof verifyWslRuntimeBundle
   readonly spawn?: typeof spawn
   readonly startupTimeoutMs?: number
   readonly shutdownTimeoutMs?: number
@@ -66,13 +129,6 @@ export interface WslHostSupervisorOptions {
   validateDirectory(runtime: WslManagedRuntime, path: string): Promise<boolean>
   openTerminal(runtime: WslManagedRuntime, ready: WslHostReady): void
   requestQuit(code: number): void
-}
-
-function packageSpecifier(value: string): string {
-  if (value.length === 0 || value.length > 4096 || value.includes('\0') || /[\r\n]/u.test(value)) {
-    throw new Error(`${BIN_NAME}: invalid WSL runtime package specifier`)
-  }
-  return value
 }
 
 function version(value: string): string {
@@ -92,25 +148,52 @@ async function runtimeIsReady(
   distribution: string,
   runtime: Pick<WslManagedRuntime, 'packageRoot' | 'hostEntryPath'>,
   productVersion: string,
+  bundle: WslRuntimeBundle,
 ): Promise<boolean> {
   const result = await capture('wsl.exe', wslExecArguments(distribution, [
     'node', '-e', VERIFY_RUNTIME_SCRIPT,
     joinPosix(runtime.packageRoot, 'package.json'),
     runtime.hostEntryPath,
     productVersion,
+    joinPosix(runtime.packageRoot, '..', '..', WSL_RUNTIME_BUNDLE_MANIFEST),
+    bundle.manifestSha256,
   ]))
   return result.exitCode === 0 && result.signal === null
+}
+
+async function removeRuntimePath(
+  capture: DesktopCommandCapture,
+  distribution: string,
+  path: string,
+): Promise<void> {
+  await capture('wsl.exe', wslExecArguments(distribution, [
+    'node', '-e', REMOVE_RUNTIME_SCRIPT, path,
+  ]), { timeoutMs: 120_000, maxOutputBytes: INSTALL_OUTPUT_LIMIT }).catch(() => {})
+}
+
+async function recoverRuntimeCommit(
+  capture: DesktopCommandCapture,
+  distribution: string,
+  target: string,
+  staging: string,
+  backup: string,
+): Promise<void> {
+  await capture('wsl.exe', wslExecArguments(distribution, [
+    'node', '-e', RECOVER_RUNTIME_SCRIPT, target, staging, backup,
+  ]), { timeoutMs: 120_000, maxOutputBytes: INSTALL_OUTPUT_LIMIT }).catch(() => {})
 }
 
 /** Validate prerequisites and install the exact desktop package into WSL when absent. */
 export async function prepareWslHostRuntime(options: {
   readonly distribution: string
   readonly productVersion: string
-  readonly packageSpecifier?: string
+  readonly runtimeBundlePath: string
   readonly capture?: DesktopCommandCapture
+  readonly verifyBundle?: typeof verifyWslRuntimeBundle
 }): Promise<WslManagedRuntime> {
   const productVersion = version(options.productVersion)
   const capture = options.capture ?? captureDesktopCommand
+  const bundle = (options.verifyBundle ?? verifyWslRuntimeBundle)(options.runtimeBundlePath, productVersion)
   const prerequisites = await probeWslHostPrerequisites(options.distribution, capture)
   const runtimeRoot = joinPosix(
     prerequisites.homeDir,
@@ -121,30 +204,70 @@ export async function prepareWslHostRuntime(options: {
   const stateDir = joinPosix(prerequisites.homeDir, '.local', 'state', 'dsh-desktop')
   const homeDir = joinPosix(prerequisites.homeDir, '.local', 'share', 'dsh-desktop', 'home')
   const candidate = { prerequisites, runtimeRoot, packageRoot, hostEntryPath, stateDir, homeDir }
-  if (await runtimeIsReady(capture, options.distribution, candidate, productVersion)) {
+  if (await runtimeIsReady(capture, options.distribution, candidate, productVersion, bundle)) {
     return Object.freeze({ ...candidate, installed: false })
   }
-  const specifier = packageSpecifier(
-    options.packageSpecifier ?? `dsh-plugin-desktop@${productVersion}`,
-  )
-  const install = await capture('wsl.exe', wslExecArguments(options.distribution, [
-    'npm', 'install',
-    '--prefix', runtimeRoot,
-    '--omit=dev', '--omit=peer', '--no-audit', '--no-fund',
-    '--',
-    specifier,
-  ]), {
-    timeoutMs: INSTALL_TIMEOUT_MS,
-    maxOutputBytes: INSTALL_OUTPUT_LIMIT,
-  })
-  if (install.exitCode !== 0 || install.signal !== null) {
-    const detail = decodeWslOutput(install.stderr).trim().split(/\r?\n/u).at(-1)
-    throw new Error(`${BIN_NAME}: failed to install the WSL Host runtime${detail === undefined || detail.length === 0 ? '' : `: ${detail}`}`)
+  const wslBundlePath = await windowsPathToWsl(options.distribution, bundle.root, capture)
+  const suffix = randomUUID()
+  const stagingRoot = `${runtimeRoot}.installing-${suffix}`
+  const backupRoot = `${runtimeRoot}.previous-${suffix}`
+  try {
+    const copied = await capture('wsl.exe', wslExecArguments(options.distribution, [
+      'node', '-e', COPY_BUNDLE_SCRIPT, wslBundlePath, stagingRoot, bundle.manifestSha256,
+    ]), {
+      timeoutMs: 120_000,
+      maxOutputBytes: INSTALL_OUTPUT_LIMIT,
+    })
+    if (copied.exitCode !== 0 || copied.signal !== null) {
+      throw new Error(`${BIN_NAME}: failed to copy the WSL Host runtime bundle`)
+    }
+    const install = await capture('wsl.exe', wslExecArguments(options.distribution, [
+      'npm', 'ci',
+      '--prefix', stagingRoot,
+      '--omit=dev', '--legacy-peer-deps', '--no-audit', '--no-fund',
+    ]), {
+      timeoutMs: INSTALL_TIMEOUT_MS,
+      maxOutputBytes: INSTALL_OUTPUT_LIMIT,
+    })
+    if (install.exitCode !== 0 || install.signal !== null) {
+      const detail = decodeWslOutput(install.stderr).trim().split(/\r?\n/u).at(-1)
+      throw new Error(`${BIN_NAME}: failed to install the WSL Host runtime${detail === undefined || detail.length === 0 ? '' : `: ${detail}`}`)
+    }
+    const staged = {
+      packageRoot: joinPosix(stagingRoot, 'node_modules', 'dsh-plugin-desktop'),
+      hostEntryPath: joinPosix(stagingRoot, 'node_modules', 'dsh-plugin-desktop', 'lib', 'wsl-host.js'),
+    }
+    if (!await runtimeIsReady(capture, options.distribution, staged, productVersion, bundle)) {
+      throw new Error(`${BIN_NAME}: installed WSL Host runtime failed version verification`)
+    }
+    let commitVerified = false
+    try {
+      const committed = await capture('wsl.exe', wslExecArguments(options.distribution, [
+        'node', '-e', COMMIT_RUNTIME_SCRIPT, runtimeRoot, stagingRoot, backupRoot,
+      ]), {
+        timeoutMs: 120_000,
+        maxOutputBytes: INSTALL_OUTPUT_LIMIT,
+      })
+      commitVerified = committed.exitCode === 0 && committed.signal === null
+        && await runtimeIsReady(capture, options.distribution, candidate, productVersion, bundle)
+    } catch (cause) {
+      await recoverRuntimeCommit(
+        capture, options.distribution, runtimeRoot, stagingRoot, backupRoot,
+      )
+      throw cause
+    }
+    if (!commitVerified) {
+      await recoverRuntimeCommit(
+        capture, options.distribution, runtimeRoot, stagingRoot, backupRoot,
+      )
+      throw new Error(`${BIN_NAME}: failed to commit the WSL Host runtime`)
+    }
+    await removeRuntimePath(capture, options.distribution, backupRoot)
+    return Object.freeze({ ...candidate, installed: true })
+  } catch (cause) {
+    await removeRuntimePath(capture, options.distribution, stagingRoot)
+    throw cause
   }
-  if (!await runtimeIsReady(capture, options.distribution, candidate, productVersion)) {
-    throw new Error(`${BIN_NAME}: installed WSL Host runtime failed version verification`)
-  }
-  return Object.freeze({ ...candidate, installed: true })
 }
 
 function readyMessage(value: unknown, runtime: WslManagedRuntime): WslHostReady {
@@ -267,8 +390,9 @@ export async function startWslHost(options: WslHostSupervisorOptions): Promise<W
   const managedRuntime = await prepareWslHostRuntime({
     distribution: options.distribution,
     productVersion: options.productVersion,
-    ...(options.packageSpecifier === undefined ? {} : { packageSpecifier: options.packageSpecifier }),
+    runtimeBundlePath: options.runtimeBundlePath,
     ...(options.capture === undefined ? {} : { capture: options.capture }),
+    ...(options.verifyBundle === undefined ? {} : { verifyBundle: options.verifyBundle }),
   })
   const spawnProcess = options.spawn ?? spawn
   const args = wslExecArguments(options.distribution, [

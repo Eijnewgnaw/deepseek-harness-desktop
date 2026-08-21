@@ -2,6 +2,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { isAbsolute as isPosixAbsolute } from 'node:path/posix'
+import { isAbsolute as isWindowsAbsolute } from 'node:path/win32'
 import type { DesktopHostTargetView } from './host-target.ts'
 import { assertWslDistributionName } from './host-target.ts'
 
@@ -211,6 +212,11 @@ function supportedNodeVersion(value: string): boolean {
   return major >= 24 || (major === 22 && minor >= 19)
 }
 
+function fullyQualifiedWindowsPath(value: string): boolean {
+  return isWindowsAbsolute(value)
+    && (/^[A-Za-z]:[\\/]/u.test(value) || /^\\\\[^\\/]+[\\/][^\\/]+/u.test(value))
+}
+
 /** Prove that one WSL2 distribution has the Linux Node/npm runtime DSH requires. */
 export async function probeWslHostPrerequisites(
   distribution: string,
@@ -244,6 +250,29 @@ export async function probeWslHostPrerequisites(
     throw new Error(`${BIN_NAME}: WSL Host requires GNU Bash`)
   }
   return Object.freeze({ distribution: name, homeDir, nodeVersion, npmVersion, bashVersion })
+}
+
+/** Resolve one absolute Windows package-resource path under the selected distribution's mount policy. */
+export async function windowsPathToWsl(
+  distribution: string,
+  windowsPath: string,
+  capture: DesktopCommandCapture = captureDesktopCommand,
+): Promise<string> {
+  const name = assertWslDistributionName(distribution)
+  if (!fullyQualifiedWindowsPath(windowsPath)
+    || windowsPath.length > 32_767
+    || windowsPath.includes('\0')
+    || /[\r\n]/u.test(windowsPath)) {
+    throw new Error(`${BIN_NAME}: WSL runtime bundle path must be an absolute Windows path`)
+  }
+  const result = await capture('wsl.exe', wslExecArguments(name, [
+    'wslpath', '-a', '-u', '--', windowsPath,
+  ]))
+  const path = successfulText(result, 'path translation')
+  if (!isPosixAbsolute(path) || path.includes('\0') || /[\r\n]/u.test(path)) {
+    throw new Error(`${BIN_NAME}: selected distribution returned an invalid translated path`)
+  }
+  return path
 }
 
 /** Build the shell-free prefix for one exact WSL distribution command. */

@@ -94,10 +94,25 @@ function stderr(message: string): void {
   process.stderr.write(`${message}\n`)
 }
 
+interface WslHostOutputDescriptor {
+  readonly fd: number
+  write: typeof process.stdout.write
+}
+
+interface WslHostErrorOutput {
+  write: typeof process.stderr.write
+}
+
 /** Keep stdout protocol-only even if a third-party Host plugin writes a notice. */
-function reserveControlOutput(): NodeJS.WritableStream {
-  const output = createWriteStream('/dev/stdout', { flags: 'w', autoClose: false })
-  process.stdout.write = process.stderr.write.bind(process.stderr) as typeof process.stdout.write
+export function reserveControlOutput(
+  stdout: WslHostOutputDescriptor = process.stdout,
+  errorOutput: WslHostErrorOutput = process.stderr,
+  createOutput: (fd: number) => NodeJS.WritableStream = fd => createWriteStream('', { fd, autoClose: false }),
+): NodeJS.WritableStream {
+  // Reuse the inherited descriptor. Reopening /dev/stdout fails with ENXIO when
+  // WSL connects fd 1 to the anonymous pipe owned by the Windows supervisor.
+  const output = createOutput(stdout.fd)
+  stdout.write = errorOutput.write.bind(errorOutput) as typeof process.stdout.write
   return output
 }
 

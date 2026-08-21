@@ -6,6 +6,7 @@ import {
   probeWslHostPrerequisites,
   type DesktopCommandCapture,
   type DesktopCommandResult,
+  windowsPathToWsl,
   wslExecArguments,
 } from '../src/wsl.ts'
 
@@ -90,5 +91,21 @@ describe('WSL Host discovery', () => {
     expect(wslExecArguments('Ubuntu', ['node', 'host.js'])).toEqual([
       '--distribution', 'Ubuntu', '--exec', 'node', 'host.js',
     ])
+  })
+
+  it('translates an absolute Windows bundle path with wslpath and no shell', async () => {
+    const capture = vi.fn<DesktopCommandCapture>(async () => result('/mnt/d/DSH Desktop/wsl-runtime\n'))
+
+    await expect(windowsPathToWsl(
+      'Ubuntu-24.04',
+      'D:\\DSH Desktop\\resources\\wsl-runtime',
+      capture,
+    )).resolves.toBe('/mnt/d/DSH Desktop/wsl-runtime')
+    expect(capture).toHaveBeenCalledWith('wsl.exe', [
+      '--distribution', 'Ubuntu-24.04', '--exec',
+      'wslpath', '-a', '-u', '--', 'D:\\DSH Desktop\\resources\\wsl-runtime',
+    ])
+    await expect(windowsPathToWsl('Ubuntu', '/mnt/c/runtime', capture))
+      .rejects.toThrow('absolute Windows path')
   })
 })
