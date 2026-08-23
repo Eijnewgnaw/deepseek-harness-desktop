@@ -855,7 +855,16 @@ async function start(): Promise<void> {
     lifecycleRecorder.transitionStartupStage(startupStage)
     const marketUserDataDir = app.getPath('userData')
     const marketSelection = readDesktopMarketStateForUserData(marketUserDataDir)
-    const prepared = prepareDesktopProfile(
+    const preparationHooks = {
+      onSettingsDocumentResolved: (settingsDocument: string) => {
+        if (startupRecoveryConfigurationPaths === undefined) return
+        startupRecoveryConfigurationPaths = {
+          ...startupRecoveryConfigurationPaths,
+          settingsDocument,
+        }
+      },
+    }
+    let prepared = prepareDesktopProfile(
       process.env.DSH_TELEMETRY_DISABLED,
       homeDir,
       process.platform,
@@ -863,15 +872,7 @@ async function start(): Promise<void> {
       pluginManagementStatePath,
       marketSelection,
       startupRecoveryStatePath,
-      {
-        onSettingsDocumentResolved: settingsDocument => {
-          if (startupRecoveryConfigurationPaths === undefined) return
-          startupRecoveryConfigurationPaths = {
-            ...startupRecoveryConfigurationPaths,
-            settingsDocument,
-          }
-        },
-      },
+      preparationHooks,
     )
     if (profileCheckpoint === undefined) {
       try {
@@ -886,11 +887,6 @@ async function start(): Promise<void> {
           `${BIN_NAME}: healthy profile checkpoints remain unavailable: ${cause instanceof Error ? cause.message : String(cause)}`,
         )
       }
-    }
-    if (prepared.marketFailure !== undefined) {
-      electronLogger.error(
-        `${BIN_NAME}: requested Market provider ${prepared.market.requested} was disabled for this generation: ${prepared.marketFailure}`,
-      )
     }
     startupStage = 'runtime-bootstrap'
     lifecycleRecorder.transitionStartupStage(startupStage)
@@ -908,6 +904,45 @@ async function start(): Promise<void> {
         })
       : undefined
     const releaseDshRuntime = generation.own(() => { dshRuntime?.dispose() })
+    if (prepared.requiresDependencyMigration) {
+      electronLogger.error(`${BIN_NAME}: migrating legacy Profile dependency layout with packaged pnpm`)
+      try {
+        await materializeProfile({
+          appExecutable: process.execPath,
+          clearEnvironmentPath: pnpmRuntime.clearEnvironmentPath,
+          pnpmBinPath,
+          nodeBinDir: pnpmRuntime.nodeBinDir,
+          nodeShimPath: pnpmRuntime.nodeShimPath,
+          homeDir,
+          profileDir: prepared.profile.dir,
+          electronVersion,
+          updateLockfile: true,
+        })
+        prepared = prepareDesktopProfile(
+          process.env.DSH_TELEMETRY_DISABLED,
+          homeDir,
+          process.platform,
+          activeProfileName,
+          pluginManagementStatePath,
+          marketSelection,
+          startupRecoveryStatePath,
+          preparationHooks,
+        )
+        if (prepared.requiresDependencyMigration) {
+          throw new Error(`${BIN_NAME}: packaged pnpm did not produce compatible Profile dependency metadata`)
+        }
+      } catch (migrationCause) {
+        const detail = migrationCause instanceof ProfileMaterializationError
+          ? migrationCause.result?.stderr || migrationCause.message
+          : migrationCause instanceof Error ? migrationCause.message : String(migrationCause)
+        throw new Error(`${BIN_NAME}: Profile dependency migration failed: ${maskSecrets(detail)}`)
+      }
+    }
+    if (prepared.marketFailure !== undefined) {
+      electronLogger.error(
+        `${BIN_NAME}: requested Market provider ${prepared.market.requested} was disabled for this generation: ${prepared.marketFailure}`,
+      )
+    }
     const desktopPnpmBootstrap: DesktopPnpmBootstrap = {
       activeProfileName,
       activeProfileDir: prepared.profile.dir,

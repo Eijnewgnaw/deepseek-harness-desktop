@@ -134,6 +134,7 @@ describe('published package surface', () => {
         '@deepseek-ai/dsh-client-connection',
         '@deepseek-ai/dsh-client-locale',
         '@deepseek-ai/dsh-client-runtime',
+        '@deepseek-ai/dsh-client-ui-renderer',
         '@deepseek-ai/dsh-client-ui-settings',
         '@deepseek-ai/dsh-client-ui-theme',
       ],
@@ -196,6 +197,27 @@ describe('published package surface', () => {
     ]) {
       expect(patch).toContain(marker)
       expect(installedClient).toContain(marker)
+    }
+  })
+
+  it('patches the browse backend to skip unreadable directory-looking entries', () => {
+    const patchPath = './patches/dsh-host-directory-picker-browse@0.1.1-rc.2.patch'
+    expect(workspaceManifest.resolutions).toMatchObject({
+      '@deepseek-ai/dsh-host-directory-picker-browse@npm:0.1.1-rc.2': expect.stringContaining(patchPath),
+      '@deepseek-ai/dsh-host-directory-picker-browse@npm:^0.1.1-rc.2': expect.stringContaining(patchPath),
+    })
+    const patch = readFileSync(new URL(patchPath, workspaceRoot), 'utf8')
+    const installedHost = readFileSync(new URL(
+      'node_modules/@deepseek-ai/dsh-host-directory-picker-browse/lib/index.js',
+      packageRoot,
+    ), 'utf8')
+    for (const marker of [
+      'Windows reparse/system directories may appear as directories but fail `stat`',
+      'let enterable = false;',
+      'if (isDirectory || isSymbolicLink) try {',
+    ]) {
+      expect(patch).toContain(marker)
+      expect(installedHost).toContain(marker)
     }
   })
 
@@ -366,10 +388,13 @@ describe('published package surface', () => {
     const applyRecovered = main.indexOf('Object.entries(shellEnvironmentResolution.updates)')
     const snapshot = main.indexOf('const environment = loadLayeredEnv')
     const install = main.indexOf('const pnpmRuntime = installDesktopPnpmRuntime')
-    const prepare = main.indexOf('const prepared = prepareDesktopProfile')
+    const prepare = main.indexOf('let prepared = prepareDesktopProfile')
     const installDsh = main.indexOf('const dshRuntime = process.platform === \'win32\'')
     const ownPnpm = main.indexOf('const releasePnpmRuntime = generation.own(')
     const ownDsh = main.indexOf('const releaseDshRuntime = generation.own(')
+    const materialize = main.indexOf('await materializeProfile({')
+    const reprepare = main.indexOf('prepared = prepareDesktopProfile(', prepare + 'let prepared'.length)
+    const pnpmBootstrap = main.indexOf('const desktopPnpmBootstrap: DesktopPnpmBootstrap = {')
     const boot = main.indexOf('const ctx = await boot')
 
     expect(recover).toBeGreaterThanOrEqual(0)
@@ -380,6 +405,9 @@ describe('published package surface', () => {
     expect(prepare).toBeGreaterThan(install)
     expect(installDsh).toBeGreaterThan(prepare)
     expect(ownDsh).toBeGreaterThan(installDsh)
+    expect(materialize).toBeGreaterThan(prepare)
+    expect(reprepare).toBeGreaterThan(materialize)
+    expect(pnpmBootstrap).toBeGreaterThan(reprepare)
     expect(boot).toBeGreaterThan(prepare)
     expect(boot).toBeGreaterThan(installDsh)
     expect(main).toContain("'dsh-plugin-desktop: packaged pnpm runtime PATH'")
@@ -435,7 +463,7 @@ describe('published package surface', () => {
     const stateCommit = main.indexOf('const stateCommit = new DesktopStartupStateCommit({')
     const claim = main.indexOf('const recoveryClaim = await installRecovery.claim()')
     const observeClaim = main.indexOf('stateCommit.observeInstallRecoveryClaim(recoveryClaim)')
-    const prepare = main.indexOf('const prepared = prepareDesktopProfile(')
+    const prepare = main.indexOf('let prepared = prepareDesktopProfile(')
     const monitor = main.indexOf('const rendererBoot = runtime.beginRendererBootMonitoring({', prepare)
     const commitHealthy = main.indexOf('commitHealthy: async () => {', monitor)
     const awaitRenderer = main.indexOf('const [, rendererVerdict] = await Promise.all([')
@@ -535,7 +563,7 @@ describe('published package surface', () => {
     const windows = [...main.matchAll(/await openStartupRecoveryWindow\(/gu)]
       .map(match => match.index)
     const prompt = main.indexOf("if (recoveryClaim.action === 'prompt')")
-    const prepare = main.indexOf('const prepared = prepareDesktopProfile(')
+    const prepare = main.indexOf('let prepared = prepareDesktopProfile(')
     const commitFailure = main.indexOf('await startupStateCommit.commitFailure({')
 
     expect(windows).toHaveLength(3)
@@ -810,6 +838,10 @@ describe('published package surface', () => {
     const installedCodeSign = readFileSync(join(dirname(appBuilderManifest), 'out/codeSign/macCodeSign.js'), 'utf8')
     const installedNsisInstaller = readFileSync(join(dirname(appBuilderManifest), 'templates/nsis/installer.nsi'), 'utf8')
     const installedNsisPortable = readFileSync(join(dirname(appBuilderManifest), 'templates/nsis/portable.nsi'), 'utf8')
+    const installedNsisSingleInstance = readFileSync(
+      join(dirname(appBuilderManifest), 'templates/nsis/include/allowOnlyOneInstallerInstance.nsh'),
+      'utf8',
+    )
 
     expect(workspaceManifest.resolutions).toMatchObject({
       'app-builder-lib@npm:26.15.7': patchResolution,
@@ -819,11 +851,14 @@ describe('published package surface', () => {
     expect(patch).toContain('importCerts(keychainFile, certPaths, cscPasswords, keychainPassword)')
     expect(patch).toContain('"-k", keychainPassword, keychainFile')
     expect(patch).toContain('ManifestLongPathAware true')
+    expect(patch).toContain("[System.IO.Path]::GetFileName($$_.Path) -ieq '${_FILE}'")
     expect(manifest.build?.toolsets?.nsis).toBe('1.2.1')
     expect(installedCodeSign).toContain('importCerts(keychainFile, certPaths, cscPasswords, keychainPassword)')
     expect(installedCodeSign).toContain('"-k", keychainPassword, keychainFile')
     expect(installedNsisInstaller).toContain('ManifestLongPathAware true')
     expect(installedNsisPortable).toContain('ManifestLongPathAware true')
+    expect(installedNsisSingleInstance).toContain("[System.IO.Path]::GetFileName($$_.Path) -ieq '${_FILE}'")
+    expect(installedNsisSingleInstance).not.toContain("$$_.Path.StartsWith('$INSTDIR', 'CurrentCultureIgnoreCase')}).Count")
   })
 
   it('starts restricted Windows shells with a hidden console show state', () => {
